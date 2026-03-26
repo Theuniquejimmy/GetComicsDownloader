@@ -2,6 +2,9 @@
 
 A desktop GUI app for browsing `getcomics.org`, searching comics, paging through results, and quickly sending mirror links to JDownloader.
 
+<img width="1377" height="915" alt="image" src="https://github.com/user-attachments/assets/ec9325d7-acf2-4231-9d64-094e3e8fe5d6" />
+
+
 ## Features
 
 - Search comics by keyword
