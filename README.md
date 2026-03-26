@@ -50,9 +50,3 @@ Some hosts use multi-step flows that change over time. This tool is designed to:
 - `settings.json` stores your saved download folder
 - `getcomics_header.png` is a cached header image
 - Both are excluded from git via `.gitignore`
-
-## Roadmap Ideas
-
-- Bulk copy all mirror links for the selected comic
-- Keyboard shortcuts for copy/open actions
-- Optional executable build for one-click launch
