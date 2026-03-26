@@ -30,12 +30,16 @@ A desktop GUI app for browsing `getcomics.org`, searching comics, paging through
 ```powershell
 cd "C:\Users\theun\Desktop\comic_downloader_gui"
 python -m pip install -r requirements.txt
+or
+just run GetComicsDownloader.exe
 ```
 
 ## Run
 
 ```powershell
 python app.py
+or
+just run GetComicsDownloader.exe
 ```
 
 ## Notes on Hoster Pages
