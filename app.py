@@ -1,9 +1,11 @@
 import json
 import math
 import os
+import sys
 import threading
 import tkinter as tk
 import webbrowser
+from ctypes import windll
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import quote_plus, urljoin
@@ -17,6 +19,7 @@ SEARCH_URL = BASE_URL + "/?s={query}"
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
 SITE_IMAGE_URL = "https://i0.wp.com/getcomics.org/share/uploads/2015/01/GetComics.INFO_.png?fit=2160%2C1080&ssl=1"
 SITE_IMAGE_FILE = os.path.join(os.path.dirname(__file__), "getcomics_header.png")
+APP_ID = "theuniquejimmy.GetComicsDownloader"
 
 
 @dataclass
@@ -108,6 +111,7 @@ class ComicsApp:
         self.search_entry.bind("<Return>", lambda _e: self.search(page=1))
 
         ttk.Button(top, text="Search", command=lambda: self.search(page=1)).pack(side=tk.LEFT)
+        ttk.Button(top, text="Refresh", command=self.refresh_results).pack(side=tk.LEFT, padx=(6, 0))
         self.prev_button = ttk.Button(top, text="Prev", command=self.prev_page)
         self.prev_button.pack(side=tk.LEFT, padx=(12, 4))
         self.next_button = ttk.Button(top, text="Next", command=self.next_page)
@@ -292,6 +296,13 @@ class ComicsApp:
         self.page_label.config(text=f"Page {self.current_page} out of {self.total_pages}")
         self._set_status("Loading search results...")
         threading.Thread(target=self._search_worker, daemon=True).start()
+
+    def refresh_results(self) -> None:
+        # For "new releases" behavior, empty search refreshes from page 1.
+        if not self.search_var.get().strip():
+            self.search(page=1)
+            return
+        self.search(page=self.current_page)
 
     def _search_worker(self) -> None:
         try:
@@ -537,7 +548,24 @@ def check_dependencies() -> bool:
 
 
 def main() -> None:
+    if sys.platform.startswith("win"):
+        try:
+            windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        except Exception:
+            pass
+
     root = tk.Tk()
+    icon_base = os.path.dirname(__file__)
+    try:
+        root.iconbitmap(os.path.join(icon_base, "icon.ico"))
+    except Exception:
+        pass
+    try:
+        icon_png = tk.PhotoImage(file=os.path.join(icon_base, "icon.png"))
+        root.iconphoto(True, icon_png)
+        root._icon_png_ref = icon_png  # Keep a reference so Tk doesn't drop the image.
+    except Exception:
+        pass
     if not check_dependencies():
         root.destroy()
         return
