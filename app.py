@@ -17,15 +17,24 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://getcomics.org"
 SEARCH_URL = BASE_URL + "/?s={query}"
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
+PAGES_AT_ONCE_MIN = 1
+PAGES_AT_ONCE_MAX = 20
 SITE_IMAGE_URL = "https://i0.wp.com/getcomics.org/share/uploads/2015/01/GetComics.INFO_.png?fit=2160%2C1080&ssl=1"
 SITE_IMAGE_FILE = os.path.join(os.path.dirname(__file__), "getcomics_header.png")
 APP_ID = "theuniquejimmy.GetComicsDownloader"
+
+
+def resource_path(filename: str) -> str:
+    # Support both normal runs and PyInstaller one-file runtime.
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
+    return os.path.join(base_path, filename)
 
 
 @dataclass
 class ComicItem:
     title: str
     url: str
+    is_separator: bool = False
 
 
 @dataclass
@@ -37,7 +46,10 @@ class MirrorItem:
 class SettingsStore:
     def __init__(self, path: str) -> None:
         self.path = path
-        self.data = {"download_folder": os.path.join(os.path.expanduser("~"), "Downloads")}
+        self.data = {
+            "download_folder": os.path.join(os.path.expanduser("~"), "Downloads"),
+            "pages_per_view": 1,
+        }
         self.load()
 
     def load(self) -> None:
@@ -62,6 +74,20 @@ class SettingsStore:
     @download_folder.setter
     def download_folder(self, value: str) -> None:
         self.data["download_folder"] = value
+        self.save()
+
+    @property
+    def pages_per_view(self) -> int:
+        raw = self.data.get("pages_per_view", 1)
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return max(PAGES_AT_ONCE_MIN, min(PAGES_AT_ONCE_MAX, n))
+
+    @pages_per_view.setter
+    def pages_per_view(self, value: int) -> None:
+        self.data["pages_per_view"] = max(PAGES_AT_ONCE_MIN, min(PAGES_AT_ONCE_MAX, int(value)))
         self.save()
 
 
@@ -90,6 +116,11 @@ class ComicsApp:
         self.current_mirrors: list[MirrorItem] = []
         self.logo_image: tk.PhotoImage | None = None
 
+        # (query, page) -> (items, total_pages); speeds up homepage / search pagination.
+        self._cache_lock = threading.Lock()
+        self._listing_cache: dict[tuple[str, int], tuple[list[ComicItem], int]] = {}
+        self._prefetch_inflight: set[tuple[str, int]] = set()
+
         self._build_ui()
         self._load_site_logo()
         self._set_status("Ready")
@@ -108,16 +139,16 @@ class ComicsApp:
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(top, textvariable=self.search_var, width=42)
         self.search_entry.pack(side=tk.LEFT, padx=(6, 8))
-        self.search_entry.bind("<Return>", lambda _e: self.search(page=1))
+        self.search_entry.bind("<Return>", lambda _e: self.search(page=1, use_cache=False))
 
-        ttk.Button(top, text="Search", command=lambda: self.search(page=1)).pack(side=tk.LEFT)
+        ttk.Button(top, text="Search", command=lambda: self.search(page=1, use_cache=False)).pack(side=tk.LEFT)
         ttk.Button(top, text="Refresh", command=self.refresh_results).pack(side=tk.LEFT, padx=(6, 0))
         self.prev_button = ttk.Button(top, text="Prev", command=self.prev_page)
         self.prev_button.pack(side=tk.LEFT, padx=(12, 4))
         self.next_button = ttk.Button(top, text="Next", command=self.next_page)
         self.next_button.pack(side=tk.LEFT)
 
-        self.page_label = ttk.Label(top, text="Page 1 out of 1")
+        self.page_label = ttk.Label(top, text="Page 1 of —")
         self.page_label.pack(side=tk.LEFT, padx=(12, 0))
         ttk.Label(top, text="Go to page:").pack(side=tk.LEFT, padx=(12, 4))
         self.goto_page_var = tk.StringVar()
@@ -125,6 +156,16 @@ class ComicsApp:
         self.goto_page_entry.pack(side=tk.LEFT, padx=(0, 4))
         self.goto_page_entry.bind("<Return>", lambda _e: self.go_to_page())
         ttk.Button(top, text="Go", command=self.go_to_page).pack(side=tk.LEFT)
+
+        pages_row = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        pages_row.pack(fill=tk.X)
+        ttk.Label(pages_row, text="Show how many pages at once:").pack(side=tk.LEFT)
+        self.pages_at_once_var = tk.StringVar(value=str(self.settings.pages_per_view))
+        self.pages_at_once_entry = ttk.Entry(pages_row, textvariable=self.pages_at_once_var, width=5)
+        self.pages_at_once_entry.pack(side=tk.LEFT, padx=(8, 0))
+        self.pages_at_once_entry.bind("<Return>", self._apply_pages_at_once)
+        self.pages_at_once_entry.bind("<FocusOut>", self._apply_pages_at_once)
+        self._applied_pages_per_view = self.settings.pages_per_view
 
         folder_bar = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         folder_bar.pack(fill=tk.X)
@@ -146,6 +187,7 @@ class ComicsApp:
         self.comics_tree = ttk.Treeview(left, columns=("title",), show="headings", selectmode="browse")
         self.comics_tree.heading("title", text="Title")
         self.comics_tree.column("title", width=760, anchor=tk.W)
+        self.comics_tree.tag_configure("separator", foreground="#8B8BA3")
         self.comics_tree.pack(fill=tk.BOTH, expand=True)
         self.comics_tree.bind("<<TreeviewSelect>>", self.on_comic_selected)
         self.comics_tree.bind("<Double-1>", lambda _e: self.open_selected_comic())
@@ -287,41 +329,163 @@ class ComicsApp:
             self.folder_var.set(selected)
             self._set_status(f"Saved download folder: {selected}")
 
-    def search(self, page: int | None = None) -> None:
+    def _get_pages_per_view(self) -> int:
+        try:
+            raw = self.pages_at_once_var.get().strip()
+            n = int(raw)
+        except (ValueError, tk.TclError):
+            n = self.settings.pages_per_view
+        return max(PAGES_AT_ONCE_MIN, min(PAGES_AT_ONCE_MAX, n))
+
+    def _apply_pages_at_once(self, _event: object = None) -> None:
+        try:
+            n = max(PAGES_AT_ONCE_MIN, min(PAGES_AT_ONCE_MAX, int(self.pages_at_once_var.get().strip())))
+        except ValueError:
+            self.pages_at_once_var.set(str(self.settings.pages_per_view))
+            return
+        self.pages_at_once_var.set(str(n))
+        if n == self._applied_pages_per_view:
+            return
+        self._applied_pages_per_view = n
+        self.settings.pages_per_view = n
+        self.search(page=self.current_page, use_cache=False)
+
+    def search(self, page: int | None = None, use_cache: bool = True) -> None:
         query = self.search_var.get().strip()
         if page is None:
             page = self.current_page
         self.current_query = query
         self.current_page = max(1, page)
-        self.page_label.config(text=f"Page {self.current_page} out of {self.total_pages}")
+        self._set_page_label_preview()
         self._set_status("Loading search results...")
-        threading.Thread(target=self._search_worker, daemon=True).start()
+        threading.Thread(target=self._search_worker, args=(use_cache,), daemon=True).start()
 
     def refresh_results(self) -> None:
         # For "new releases" behavior, empty search refreshes from page 1.
         if not self.search_var.get().strip():
-            self.search(page=1)
+            self.search(page=1, use_cache=False)
             return
-        self.search(page=self.current_page)
+        self.search(page=self.current_page, use_cache=False)
 
-    def _search_worker(self) -> None:
+    def _set_page_label_preview(self) -> None:
+        a = self.current_page
+        tp = max(self.total_pages, 1)
+        n = self._get_pages_per_view()
+        last = min(a + n - 1, tp)
+        if n > 1 and last > a:
+            self.page_label.config(text=f"Pages {a}–{last} of {tp} (loading…)")
+        else:
+            self.page_label.config(text=f"Page {a} of {tp} (loading…)")
+
+    def _page_range_label(self) -> str:
+        a = self.current_page
+        tp = self.total_pages
+        n = self._get_pages_per_view()
+        last = min(a + n - 1, tp)
+        if tp <= 1:
+            return f"Page {a} of {tp}"
+        if last > a:
+            return f"Pages {a}–{last} of {tp}"
+        return f"Page {a} of {tp}"
+
+    def _listing_url(self, query: str, page: int) -> str:
+        if query:
+            search_root = SEARCH_URL.format(query=quote_plus(query))
+        else:
+            search_root = BASE_URL
+        if page > 1:
+            return f"{BASE_URL}/page/{page}/?s={quote_plus(query)}"
+        return search_root
+
+    def _prefetch_pages(self, query: str, p1: int, p2: int, total_pages: int) -> None:
+        for p in (p1, p2):
+            if p <= total_pages:
+                self._prefetch_listing(query, p)
+
+    def _prefetch_listing(self, query: str, page: int) -> None:
+        key = (query, page)
+        with self._cache_lock:
+            if key in self._listing_cache or key in self._prefetch_inflight:
+                return
+            self._prefetch_inflight.add(key)
         try:
-            if self.current_query:
-                search_root = SEARCH_URL.format(query=quote_plus(self.current_query))
-            else:
-                search_root = BASE_URL
-
-            if self.current_page > 1:
-                url = f"{BASE_URL}/page/{self.current_page}/?s={quote_plus(self.current_query)}"
-            else:
-                url = search_root
-
+            url = self._listing_url(query, page)
             resp = self.session.get(url, timeout=20)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
             items = self._parse_search_results(soup)
             total_pages = self._parse_total_pages(soup)
-            self.root.after(0, lambda: self._update_results(items, total_pages))
+            with self._cache_lock:
+                if key not in self._listing_cache:
+                    self._listing_cache[key] = (items, total_pages)
+        except Exception:
+            pass
+        finally:
+            with self._cache_lock:
+                self._prefetch_inflight.discard(key)
+
+    def _fetch_listing_page(self, q: str, p: int, use_cache: bool) -> tuple[list[ComicItem], int]:
+        key = (q, p)
+        if use_cache:
+            with self._cache_lock:
+                hit = self._listing_cache.get(key)
+            if hit:
+                return hit[0], hit[1]
+        url = self._listing_url(q, p)
+        resp = self.session.get(url, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items = self._parse_search_results(soup)
+        total_pages = self._parse_total_pages(soup)
+        with self._cache_lock:
+            self._listing_cache[key] = (items, total_pages)
+        return items, total_pages
+
+    def _page_separator_item(self, page_num: int) -> ComicItem:
+        return ComicItem(title=f"  — Page {page_num} —  ", url="", is_separator=True)
+
+    def _merge_visible_pages(self, q: str, start: int, use_cache: bool) -> tuple[list[ComicItem], int]:
+        n = self._get_pages_per_view()
+        items1, total_pages = self._fetch_listing_page(q, start, use_cache)
+        merged = list(items1)
+        for offset in range(1, n):
+            p = start + offset
+            if p > total_pages:
+                break
+            items_n, _ = self._fetch_listing_page(q, p, use_cache)
+            merged.append(self._page_separator_item(p))
+            merged.extend(items_n)
+        return merged, total_pages
+
+    def _search_worker(self, use_cache: bool = True) -> None:
+        q = self.current_query
+        start = self.current_page
+        n = self._get_pages_per_view()
+        try:
+            if not use_cache:
+                with self._cache_lock:
+                    for i in range(n):
+                        self._listing_cache.pop((q, start + i), None)
+                    if start == 1:
+                        for k in list(self._listing_cache.keys()):
+                            if k[0] == q:
+                                del self._listing_cache[k]
+
+            merged, total_pages = self._merge_visible_pages(q, start, use_cache)
+            self.root.after(
+                0,
+                lambda m=merged, tp=total_pages: self._update_results(m, tp),
+            )
+
+            block_end = min(start + n - 1, total_pages)
+            if block_end < total_pages:
+                n1 = start + n
+                n2 = start + n + 1
+                threading.Thread(
+                    target=self._prefetch_pages,
+                    args=(q, n1, n2, total_pages),
+                    daemon=True,
+                ).start()
         except Exception as ex:
             self.root.after(0, lambda: self._set_status(f"Search failed: {ex}"))
 
@@ -352,7 +516,7 @@ class ComicsApp:
         self.total_pages = max(1, total_pages)
         if self.current_page > self.total_pages:
             self.current_page = self.total_pages
-        self.page_label.config(text=f"Page {self.current_page} out of {self.total_pages}")
+        self.page_label.config(text=self._page_range_label())
         self._update_pagination_buttons()
         self.current_results = items
         self.current_mirrors = []
@@ -362,17 +526,22 @@ class ComicsApp:
             self.mirror_tree.delete(row)
 
         for idx, item in enumerate(items):
-            self.comics_tree.insert("", tk.END, iid=str(idx), values=(item.title,))
+            tags = ("separator",) if item.is_separator else ()
+            self.comics_tree.insert("", tk.END, iid=str(idx), values=(item.title,), tags=tags)
 
-        self._set_status(f"Loaded {len(items)} comics")
+        n_comics = sum(1 for it in items if not it.is_separator)
+        self._set_status(f"Loaded {n_comics} comics ({self._page_range_label()})")
 
     def prev_page(self) -> None:
+        n = self._get_pages_per_view()
         if self.current_page > 1:
-            self.search(page=self.current_page - 1)
+            self.search(page=max(1, self.current_page - n))
 
     def next_page(self) -> None:
-        if self.current_page < self.total_pages:
-            self.search(page=self.current_page + 1)
+        n = self._get_pages_per_view()
+        block_end = min(self.current_page + n - 1, self.total_pages)
+        if block_end < self.total_pages:
+            self.search(page=self.current_page + n)
 
     def go_to_page(self) -> None:
         raw = self.goto_page_var.get().strip()
@@ -388,9 +557,14 @@ class ComicsApp:
         if page != self.current_page:
             self.search(page=page)
 
+    def _pair_end_page(self) -> int:
+        n = self._get_pages_per_view()
+        return min(self.current_page + n - 1, self.total_pages)
+
     def _update_pagination_buttons(self) -> None:
         self.prev_button.configure(state=tk.NORMAL if self.current_page > 1 else tk.DISABLED)
-        self.next_button.configure(state=tk.NORMAL if self.current_page < self.total_pages else tk.DISABLED)
+        next_ok = self._pair_end_page() < self.total_pages
+        self.next_button.configure(state=tk.NORMAL if next_ok else tk.DISABLED)
 
     def on_comic_selected(self, _event: object = None) -> None:
         selection = self.comics_tree.selection()
@@ -399,6 +573,8 @@ class ComicsApp:
         idx = int(selection[0])
         if 0 <= idx < len(self.current_results):
             comic = self.current_results[idx]
+            if comic.is_separator or not comic.url:
+                return
             self._set_status(f"Loading mirrors for: {comic.title}")
             threading.Thread(target=self._load_mirrors_worker, args=(comic.url,), daemon=True).start()
 
@@ -412,39 +588,100 @@ class ComicsApp:
         except Exception as ex:
             self.root.after(0, lambda: self._set_status(f"Failed to load mirrors: {ex}"))
 
-    def _parse_mirrors(self, soup: BeautifulSoup) -> list[MirrorItem]:
-        mirrors: list[MirrorItem] = []
-        seen = set()
+    def _mirror_href_looks_like_download(self, href: str) -> bool:
+        h = href.lower()
+        if "/dlds/" in h:
+            return True
+        return any(
+            x in h
+            for x in (
+                "mega.nz",
+                "mediafire.com",
+                "zippyshare.com",
+                "pixeldrain.com",
+                "dropapk.to",
+                "ufile.io",
+                "torrentgalaxy.to",
+                "magnet:?",
+            )
+        )
 
-        # GetComics commonly wraps links in "aio-button-center" buttons on post pages.
-        for a in soup.select(".aio-button-center a"):
-            href = a.get("href", "").strip()
-            name = a.get_text(" ", strip=True) or "Mirror"
+    def _mirror_link_text_suggests_host(self, text: str) -> bool:
+        t = " ".join(text.lower().split())
+        if not t:
+            return False
+        keys = (
+            "main server",
+            "mega",
+            "mediafire",
+            "zippyshare",
+            "pixeldrain",
+            "pixel drain",
+            "ufile",
+            "dropapk",
+            "vikingfile",
+            "viking file",
+            "rootz",
+            "torrent",
+            "mirror",
+        )
+        return any(k in t for k in keys)
+
+    def _mirror_href_is_junk(self, href: str) -> bool:
+        h = href.lower()
+        if "getcomics.org" in h and "/dlds/" not in h:
+            return True
+        if any(
+            x in h
+            for x in (
+                "imgur.com",
+                "twitter.com",
+                "facebook.com",
+                "yacreader.com",
+                "comicrack.",
+                "7-zip.org",
+                "wp-admin",
+                "admin-ajax.php",
+                "/tag/",
+                "/cat/",
+                "/author/",
+                "getcomics.info",
+            )
+        ):
+            return True
+        return False
+
+    def _parse_mirrors(self, soup: BeautifulSoup) -> list[MirrorItem]:
+        """Collect mirror links from styled buttons and from post body (story-arc layout)."""
+        mirrors: list[MirrorItem] = []
+        seen_urls: set[str] = set()
+
+        # Story-arc and newer posts often put mirrors only in .single-post; .aio-button-center
+        # may be empty or only contain a torrent link.
+        anchors = soup.select(".single-post a[href], .aio-button-center a[href]")
+        if not anchors:
+            anchors = soup.select("article .post-content a[href], .aio-button-center a[href]")
+        if not anchors:
+            anchors = soup.select(".aio-button-center a[href]")
+
+        for a in anchors:
+            href = (a.get("href") or "").strip()
             if not href:
                 continue
-            href = urljoin(BASE_URL, href)
-            key = (name.lower(), href)
-            if key in seen:
+            full = urljoin(BASE_URL, href)
+            if full in seen_urls:
                 continue
-            seen.add(key)
-            mirrors.append(MirrorItem(name=name, url=href))
-
-        # Fallback selector if theme changes.
-        if not mirrors:
-            for a in soup.select("a"):
-                href = a.get("href", "").strip()
-                text = a.get_text(" ", strip=True).lower()
-                if not href:
-                    continue
-                host_keywords = ("mega", "mediafire", "pixeldrain", "viking", "rootz", "download")
-                if any(k in text for k in host_keywords):
-                    href = urljoin(BASE_URL, href)
-                    name = a.get_text(" ", strip=True) or "Mirror"
-                    key = (name.lower(), href)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    mirrors.append(MirrorItem(name=name, url=href))
+            if self._mirror_href_is_junk(full):
+                continue
+            text = a.get_text(" ", strip=True)
+            if not (
+                self._mirror_href_looks_like_download(full)
+                or self._mirror_link_text_suggests_host(text)
+            ):
+                continue
+            seen_urls.add(full)
+            name = text or "Mirror"
+            mirrors.append(MirrorItem(name=name, url=full))
 
         return mirrors
 
@@ -458,7 +695,7 @@ class ComicsApp:
 
     def open_selected_comic(self) -> None:
         item = self._get_selected_comic()
-        if not item:
+        if not item or item.is_separator or not item.url:
             return
         webbrowser.open(item.url)
 
@@ -496,12 +733,12 @@ class ComicsApp:
 
     def copy_selected_comic_url(self) -> None:
         item = self._get_selected_comic()
-        if item:
+        if item and not item.is_separator and item.url:
             self._copy_to_clipboard(item.url, "Comic URL copied")
 
     def copy_selected_comic_title(self) -> None:
         item = self._get_selected_comic()
-        if item:
+        if item and not item.is_separator:
             self._copy_to_clipboard(item.title, "Comic title copied")
 
     def copy_selected_mirror_url(self) -> None:
@@ -555,13 +792,12 @@ def main() -> None:
             pass
 
     root = tk.Tk()
-    icon_base = os.path.dirname(__file__)
     try:
-        root.iconbitmap(os.path.join(icon_base, "icon.ico"))
+        root.iconbitmap(resource_path("icon.ico"))
     except Exception:
         pass
     try:
-        icon_png = tk.PhotoImage(file=os.path.join(icon_base, "icon.png"))
+        icon_png = tk.PhotoImage(file=resource_path("icon.png"))
         root.iconphoto(True, icon_png)
         root._icon_png_ref = icon_png  # Keep a reference so Tk doesn't drop the image.
     except Exception:
